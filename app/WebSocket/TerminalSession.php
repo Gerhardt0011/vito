@@ -12,6 +12,9 @@ class TerminalSession
 {
     protected SSH2 $ssh;
 
+    /** @var resource|null */
+    protected mixed $stream = null;
+
     protected bool $closed = false;
 
     /**
@@ -51,7 +54,14 @@ class TerminalSession
         $this->ssh->setWindowSize($this->initialCols, $this->initialRows);
         $this->ssh->openShell();
 
-        $this->loop->addReadStream($this->ssh->fsock, function ($stream): void {
+        $this->registerStream();
+    }
+
+    protected function registerStream(): void
+    {
+        $this->stream = $this->ssh->fsock;
+
+        $this->loop->addReadStream($this->stream, function ($stream): void {
             if ($this->closed) {
                 return;
             }
@@ -110,8 +120,9 @@ class TerminalSession
         $this->closed = true;
 
         try {
-            if (isset($this->ssh->fsock) && is_resource($this->ssh->fsock)) {
-                $this->loop->removeReadStream($this->ssh->fsock);
+            if ($this->stream !== null) {
+                $this->loop->removeReadStream($this->stream);
+                $this->stream = null;
             }
         } catch (\Throwable) {
         }
