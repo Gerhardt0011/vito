@@ -1,9 +1,11 @@
 <?php
 
+use App\Actions\Monitoring\GetMetrics;
 use App\Enums\ServiceStatus;
 use App\Models\Metric;
 use App\Models\Service;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 use Inertia\Testing\AssertableInertia;
 
 uses(RefreshDatabase::class);
@@ -127,3 +129,77 @@ test('monitoring json defaults period when missing', function () {
         ->assertJsonPath('current', null)
         ->assertJsonPath('history', []);
 });
+
+test('monitoring history generates MySQL safe grouped SQL', function (array $input, string $format) {
+    $this->travelTo(now()->setDate(2026, 10, 23)->setTime(12, 0));
+
+    config()->set('database.connections.metrics_mysql', [
+        'driver' => 'mysql',
+        'database' => 'metrics_sql_test',
+        'prefix' => '',
+    ]);
+    $default = DB::getDefaultConnection();
+    $connection = DB::connection('metrics_mysql');
+    $connection->setPdo(DB::connection()->getPdo());
+
+    try {
+        DB::setDefaultConnection('metrics_mysql');
+        $queries = $connection->pretend(fn () => app(GetMetrics::class)->filter($this->server, $input));
+    } finally {
+        DB::setDefaultConnection($default);
+        DB::purge('metrics_mysql');
+    }
+
+    expect($queries)->toHaveCount(1);
+    $sql = $queries[0]['query'];
+
+    expect($sql)
+        ->toContain("DATE_FORMAT(`created_at`, '{$format}') as `date`")
+        ->toContain('ROUND(AVG(`load`), 2) as `load`')
+        ->toContain('MAX(`oom_kill_count`) as `oom_kill_count`')
+        ->toContain('group by `date` order by `date` asc')
+        ->not->toContain('strftime', 'AVG(load)', 'created_at as date', '`created_at` as `date`', 'date_interval');
+})->with([
+    'ten minutes' => [['period' => '10m'], '%Y-%m-%d %H:%i:00'],
+    'one hour' => [['period' => '1h'], '%Y-%m-%d %H:%i:00'],
+    'twelve hours' => [['period' => '12h'], '%Y-%m-%d %H:00:00'],
+    'one day' => [['period' => '1d'], '%Y-%m-%d %H:00:00'],
+    'seven days' => [['period' => '7d'], '%Y-%m-%d 00:00:00'],
+    'custom day' => [['period' => 'custom', 'from' => '2026-10-23', 'to' => '2026-10-23'], '%Y-%m-%d %H:00:00'],
+    'custom days' => [['period' => 'custom', 'from' => '2026-10-21', 'to' => '2026-10-23'], '%Y-%m-%d 00:00:00'],
+]);
+
+test('monitoring json aggregates SQLite history using bucket dates', function (string $period, array $dates, array $buckets) {
+    $this->travelTo(now()->setDate(2026, 10, 23)->setTime(12, 0));
+    $this->actingAs($this->user);
+
+    foreach ($dates as $index => $date) {
+        Metric::factory()->create([
+            'server_id' => $this->server->id,
+            'created_at' => $date,
+            'load' => [1.25, 2.5, 8.75][$index],
+            'memory_total' => 2000,
+            'memory_used' => [500, 1000, 1500][$index],
+            'disk_total' => 1000,
+            'disk_used' => [100, 300, 500][$index],
+            'oom_kill_count' => [1, 3, 2][$index],
+        ]);
+    }
+
+    $response = $this->getJson(route('monitoring.json', ['server' => $this->server, 'period' => $period]));
+
+    $response->assertSuccessful()
+        ->assertJsonCount(2, 'history')
+        ->assertJsonPath('history.0.date', $buckets[0])
+        ->assertJsonPath('history.1.date', $buckets[1])
+        ->assertJsonPath('history.0.load', 1.88)
+        ->assertJsonPath('history.1.load', 8.75)
+        ->assertJsonPath('history.0.memory_used_percent', 37.5)
+        ->assertJsonPath('history.0.disk_used_percent', 20)
+        ->assertJsonPath('history.0.oom_kill_count', 3)
+        ->assertJsonMissingPath('history.0.date_interval');
+})->with([
+    'minute' => ['10m', ['2026-10-23 11:58:10', '2026-10-23 11:58:50', '2026-10-23 11:59:10'], ['2026-10-23 11:58', '2026-10-23 11:59']],
+    'hour' => ['12h', ['2026-10-23 10:10:10', '2026-10-23 10:50:50', '2026-10-23 11:10:10'], ['2026-10-23 10:00', '2026-10-23 11:00']],
+    'day' => ['7d', ['2026-10-21 10:10:10', '2026-10-21 11:10:10', '2026-10-22 10:10:10'], ['2026-10-21 00:00', '2026-10-22 00:00']],
+]);

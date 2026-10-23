@@ -5,9 +5,8 @@ namespace App\Actions\Monitoring;
 use App\Models\Metric;
 use App\Models\Server;
 use Carbon\Carbon;
-use Illuminate\Contracts\Database\Query\Expression;
+use Illuminate\Database\Query\Grammars\MySqlGrammar;
 use Illuminate\Support\Collection;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
 use stdClass;
@@ -83,41 +82,37 @@ class GetMetrics
         Server $server,
         Carbon $fromDate,
         Carbon $toDate,
-        ?Expression $interval = null
+        string $interval
     ): Collection {
-        return DB::table('metrics')
+        $query = Metric::query()->toBase();
+        $grammar = $query->getGrammar();
+        $createdAt = $grammar->wrap('created_at');
+        $bucket = $grammar instanceof MySqlGrammar
+            ? "DATE_FORMAT({$createdAt}, '".str_replace('%M', '%i', $interval)."')"
+            : "strftime('{$interval}', {$createdAt})";
+        $floatFields = [
+            'load', 'memory_total', 'memory_used', 'memory_free',
+            'disk_total', 'disk_used', 'disk_free',
+            'cpu_usage_percent', 'cpu_steal_percent',
+            'swap_total', 'swap_used', 'swap_free', 'swap_used_percent',
+        ];
+
+        $query->selectRaw($bucket.' as '.$grammar->wrap('date'));
+        foreach ($floatFields as $field) {
+            $column = $grammar->wrap($field);
+            $precision = in_array($field, ['swap_total', 'swap_used', 'swap_free']) ? 0 : 2;
+            $query->selectRaw("ROUND(AVG({$column}), {$precision}) as {$column}");
+        }
+        $oomKillCount = $grammar->wrap('oom_kill_count');
+
+        return $query
             ->where('server_id', $server->id)
             ->whereBetween('created_at', [$fromDate->format('Y-m-d H:i:s'), $toDate->format('Y-m-d H:i:s')])
-            ->select(
-                [
-                    DB::raw('created_at as date'),
-                    DB::raw('ROUND(AVG(load), 2) as load'),
-                    DB::raw('ROUND(AVG(memory_total), 2) as memory_total'),
-                    DB::raw('ROUND(AVG(memory_used), 2) as memory_used'),
-                    DB::raw('ROUND(AVG(memory_free), 2) as memory_free'),
-                    DB::raw('ROUND(AVG(disk_total), 2) as disk_total'),
-                    DB::raw('ROUND(AVG(disk_used), 2) as disk_used'),
-                    DB::raw('ROUND(AVG(disk_free), 2) as disk_free'),
-                    DB::raw('ROUND(AVG(cpu_usage_percent), 2) as cpu_usage_percent'),
-                    DB::raw('ROUND(AVG(cpu_steal_percent), 2) as cpu_steal_percent'),
-                    DB::raw('ROUND(AVG(swap_total), 0) as swap_total'),
-                    DB::raw('ROUND(AVG(swap_used), 0) as swap_used'),
-                    DB::raw('ROUND(AVG(swap_free), 0) as swap_free'),
-                    DB::raw('ROUND(AVG(swap_used_percent), 2) as swap_used_percent'),
-                    DB::raw('MAX(oom_kill_count) as oom_kill_count'),
-                    $interval,
-                ],
-            )
-            ->groupByRaw('date_interval')
-            ->orderBy('date_interval')
+            ->selectRaw("MAX({$oomKillCount}) as {$oomKillCount}")
+            ->groupBy('date')
+            ->orderBy('date')
             ->get()
-            ->map(function ($item): stdClass {
-                $floatFields = [
-                    'load', 'memory_total', 'memory_used', 'memory_free',
-                    'disk_total', 'disk_used', 'disk_free',
-                    'cpu_usage_percent', 'cpu_steal_percent',
-                    'swap_total', 'swap_used', 'swap_free', 'swap_used_percent',
-                ];
+            ->map(function ($item) use ($floatFields): stdClass {
                 foreach ($floatFields as $key) {
                     $item->{$key} = $item->{$key} !== null ? (float) $item->{$key} : null;
                 }
@@ -129,7 +124,6 @@ class GetMetrics
                 $item->memory_used_percent = ($item->memory_total ?? 0) > 0
                     ? round(($item->memory_used / $item->memory_total) * 100, 2)
                     : null;
-                unset($item->date_interval);
 
                 return $item;
             });
@@ -162,7 +156,7 @@ class GetMetrics
     /**
      * @param  array<string, mixed>  $input
      */
-    private function getInterval(array $input): Expression
+    private function getInterval(array $input): string
     {
         if ($input['period'] === 'custom') {
             $from = new Carbon($input['from']);
@@ -177,14 +171,14 @@ class GetMetrics
         }
 
         if (abs($periodInHours) <= 1) {
-            return DB::raw("strftime('%Y-%m-%d %H:%M:00', created_at) as date_interval");
+            return '%Y-%m-%d %H:%M:00';
         }
 
-        if ($periodInHours <= 24) {
-            return DB::raw("strftime('%Y-%m-%d %H:00:00', created_at) as date_interval");
+        if (abs($periodInHours) <= 24) {
+            return '%Y-%m-%d %H:00:00';
         }
 
-        return DB::raw("strftime('%Y-%m-%d 00:00:00', created_at) as date_interval");
+        return '%Y-%m-%d 00:00:00';
     }
 
     private function validate(array $input): void
